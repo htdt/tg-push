@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tg-push"
-version = "2.0.3"
+version = "2.1.0"
 description = "Single-shot CLI for sending text plus an optional file to Telegram."
 readme = "README.md"
 license = "MIT"

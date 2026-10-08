@@ -9,7 +9,7 @@ import sys
 import urllib.error
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 TEXT_LIMIT = 4096
@@ -40,6 +40,7 @@ class CliError(RuntimeError):
 class Args:
     text: str = ""
     file: str = ""
+    stdin: bool = False
     help: bool = False
 
 
@@ -57,16 +58,45 @@ def usage(program_name: str) -> str:
             f"  {program_name} --file ./image.png",
             f"  {program_name} --text \"caption\" --file ./video.mp4",
             f"  {program_name} --text \"report\" --file ./report.pdf",
+            f"  git log -5 | {program_name} --stdin",
+            f"  {program_name} --stdin --file ./report.pdf < notes.txt",
+            "",
+            "Options:",
+            "  --text TEXT    Message text, or the caption when --file is given",
+            "  --file PATH    File to send",
+            "  --stdin        Read the message text from standard input instead of --text",
+            "  -h, --help     Show this help",
             "",
             "Environment:",
             "  TG_BOT_TOKEN   Telegram bot token (required)",
             "  TG_CHAT_ID     Target chat ID or @channelusername (required)",
             "",
+            "Multi-line text:",
+            "  Text is sent as-is, as plain text (no Markdown or HTML parsing). Telegram",
+            "  breaks the line wherever the text contains a real newline character; an",
+            "  empty line gives a paragraph gap. A typed backslash-n is not converted:",
+            f"  {program_name} --text \"one\\ntwo\" arrives as the literal one\\ntwo.",
+            "",
+            "  Ways to pass real newlines:",
+            f"    {program_name} --text $'line one\\nline two'      # bash/zsh $'...' quoting",
+            f"    {program_name} --text \"line one",
+            "    line two\"                                 # press Enter inside the quotes",
+            f"    printf 'line one\\nline two\\n' | {program_name} --stdin",
+            f"    {program_name} --stdin <<'EOF'              # best for long messages",
+            "    line one",
+            "",
+            "    line three, after a blank line",
+            "    EOF",
+            "",
+            "  With --stdin, trailing newlines are dropped; everything else is kept.",
+            "",
             "Notes:",
-            "  - At least one of --text or --file is required.",
+            "  - At least one of --text, --stdin or --file is required.",
+            "  - --text and --stdin cannot be combined.",
             "  - Images and videos are sent as Telegram media when the extension is recognized.",
             "  - Other files are sent as documents, so PDFs, archives, and extensionless files work.",
-            "  - If --text is too long for a media caption, the file is sent first and the text is sent as follow-up messages.",
+            "  - If the text is too long for a media caption, the file is sent first and the text is sent as follow-up messages.",
+            f"  - Text over {TEXT_LIMIT} characters is split into several messages, at line breaks where possible.",
         ]
     )
 
@@ -86,7 +116,12 @@ def parse_args(argv: list[str], program_name: str) -> Args:
         current = argv[index]
 
         if current in {"--help", "-h"}:
-            args = Args(text=args.text, file=args.file, help=True)
+            args = replace(args, help=True)
+            index += 1
+            continue
+
+        if current == "--stdin":
+            args = replace(args, stdin=True)
             index += 1
             continue
 
@@ -98,13 +133,17 @@ def parse_args(argv: list[str], program_name: str) -> Args:
 
         value = argv[index + 1]
         if current == "--text":
-            args = Args(text=value, file=args.file, help=args.help)
+            args = replace(args, text=value)
         else:
-            args = Args(text=args.text, file=value, help=args.help)
+            args = replace(args, file=value)
 
         index += 2
 
     return args
+
+
+def read_stdin_text() -> str:
+    return sys.stdin.read().rstrip("\r\n")
 
 
 def get_config() -> Config:
@@ -194,18 +233,36 @@ def telegram_request(
     return payload.get("result")
 
 
-def send_text(token: str, chat_id: str, text: str) -> int:
-    if not text:
-        return 0
+def split_text(text: str, limit: int = TEXT_LIMIT) -> list[str]:
+    chunks = []
+    start = 0
 
+    while len(text) - start > limit:
+        # Break at the last newline that keeps the chunk within the limit.
+        newline = text.rfind("\n", start + 1, start + limit + 1)
+        if newline == -1:
+            end = next_start = start + limit
+        else:
+            end, next_start = newline, newline + 1
+
+        chunks.append(text[start:end])
+        start = next_start
+
+    chunks.append(text[start:])
+
+    # Telegram rejects messages that are empty or whitespace-only.
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def send_text(token: str, chat_id: str, text: str) -> int:
     sent = 0
-    for start in range(0, len(text), TEXT_LIMIT):
+    for chunk in split_text(text):
         telegram_request(
             token,
             "sendMessage",
             json_payload={
                 "chat_id": chat_id,
-                "text": text[start : start + TEXT_LIMIT],
+                "text": chunk,
             },
         )
         sent += 1
@@ -303,19 +360,27 @@ def main(argv: list[str] | None = None) -> int:
             print(usage(program_name))
             return 0
 
-        if not args.text and not args.file:
+        if args.stdin and args.text:
+            raise CliError("--text and --stdin cannot be combined.")
+
+        if not args.text and not args.stdin and not args.file:
             raise CliError(
-                f"At least one of --text or --file is required.\n\n{usage(program_name)}"
+                "At least one of --text, --stdin or --file is required."
+                f"\n\n{usage(program_name)}"
             )
+
+        text = read_stdin_text() if args.stdin else args.text
+        if not text.strip() and not args.file:
+            raise CliError("No text to send: standard input was empty.")
 
         config = get_config()
         if args.file:
             file_label, message_count = send_file(
-                config.token, config.chat_id, args.file, args.text
+                config.token, config.chat_id, args.file, text
             )
         else:
             file_label = ""
-            message_count = send_text(config.token, config.chat_id, args.text)
+            message_count = send_text(config.token, config.chat_id, text)
 
         print(describe_delivery(config.chat_id, file_label, message_count))
         return 0
